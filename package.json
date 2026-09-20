@@ -82,10 +82,10 @@
     "prepare": "husky"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.2.0",
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "classic-level": "^3.0.0",
-    "protobufjs": "^8.6.6",
-    "zod": "^4.3.5"
+    "protobufjs": "^8.8.0",
+    "zod": "^4.6.5"
   },
   "devDependencies": {
     "@anthropic-ai/mcpb": "latest",
