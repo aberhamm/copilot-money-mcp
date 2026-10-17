@@ -6,6 +6,9 @@
  */
 
 import { describe, test, expect } from 'bun:test';
+import { mkdtempSync, rmSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
 
 const CLI_PATH = new URL('../../src/cli.ts', import.meta.url).pathname;
 
@@ -23,7 +26,13 @@ async function runCli(
   const proc = Bun.spawn(['bun', 'run', CLI_PATH, ...args], {
     // Start from a clean selection so the developer's own COPILOT_BROWSER*
     // never leaks into these tests; `env` then adds what a test sets.
-    env: { ...process.env, COPILOT_BROWSER: '', COPILOT_BROWSER_PROFILE: '', ...env },
+    env: {
+      ...process.env,
+      COPILOT_BROWSER: '',
+      COPILOT_BROWSER_PROFILE: '',
+      COPILOT_BROWSER_DATA_DIR: '',
+      ...env,
+    },
     stdout: 'pipe',
     stderr: 'pipe',
     // Don't provide stdin so the server has nothing to read from
@@ -244,6 +253,71 @@ describe('CLI entry point', () => {
       ]);
 
       expect(stderr).toContain('Browser selection Microsoft Edge (profile "Work") ignored');
+    });
+  });
+
+  describe('--browser-data-dir', () => {
+    test('--help documents the flag and COPILOT_BROWSER_DATA_DIR', async () => {
+      const { stderr } = await runCli(['--help']);
+
+      expect(stderr).toContain('--browser-data-dir <path>');
+      expect(stderr).toContain('COPILOT_BROWSER_DATA_DIR');
+    });
+
+    test('without --browser exits 1', async () => {
+      const { exitCode, stderr } = await runCli(['--browser-data-dir', tmpdir(), '--live-reads']);
+
+      expect(exitCode).toBe(1);
+      expect(stderr).toContain('--browser-data-dir (COPILOT_BROWSER_DATA_DIR) requires --browser');
+    });
+
+    test('COPILOT_BROWSER_DATA_DIR without a browser exits 1', async () => {
+      const { exitCode, stderr } = await runCli(['--live-reads'], {
+        COPILOT_BROWSER_DATA_DIR: tmpdir(),
+      });
+
+      expect(exitCode).toBe(1);
+      expect(stderr).toContain('requires --browser');
+    });
+
+    test('a path that does not exist exits 1', async () => {
+      const missing = join(tmpdir(), `cmm-no-such-dir-${process.pid}-${Date.now()}`);
+      const { exitCode, stderr } = await runCli([
+        '--browser',
+        'chrome',
+        '--browser-data-dir',
+        missing,
+      ]);
+
+      expect(exitCode).toBe(1);
+      expect(stderr).toContain(`"${missing}" does not exist.`);
+    });
+
+    test('Safari with a data dir exits 1', async () => {
+      const { exitCode, stderr } = await runCli(
+        ['--browser', 'safari', '--browser-data-dir', tmpdir()],
+        {}
+      );
+
+      expect(exitCode).toBe(1);
+      // On Linux Safari is refused first for the platform; elsewhere for the data dir.
+      expect(stderr).toMatch(
+        /Safari (does not support --browser-data-dir|is not supported on this platform)/
+      );
+    });
+
+    test('the flag wins over the env var, and verbose mode names the data dir', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'cmm-cli-datadir-'));
+      try {
+        const { stderr } = await runCli(['--browser', 'brave', '--browser-data-dir', dir, '-v'], {
+          COPILOT_BROWSER_DATA_DIR: join(dir, 'does-not-exist'),
+        });
+
+        expect(stderr).not.toContain('does not exist');
+        expect(stderr).toContain(`Brave (data dir "${dir}")`);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
     });
   });
 });

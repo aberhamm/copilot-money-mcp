@@ -10,12 +10,14 @@
  */
 
 import { readdirSync, readFileSync, existsSync, statSync, type Dirent } from 'fs';
-import { isAbsolute, join } from 'path';
+import { basename, isAbsolute, join } from 'path';
 import { homedir } from 'os';
 import { retryInterrupted } from '../fs-retry.js';
 import {
   BROWSER_DISPLAY_NAMES,
   describeBrowserSelection,
+  isFirefoxProfileDir,
+  matchesFirefoxProfileName,
   type BrowserId,
   type BrowserSelection,
 } from './browser-selection.js';
@@ -389,6 +391,8 @@ export interface SelectionReport {
   /** Display name alone, e.g. `Brave`. */
   browser: string;
   profile?: string;
+  /** The custom `--browser-data-dir`, when one replaced the defaults. */
+  dataDir?: string;
   /** Set when the browser's data or the profile was not found on disk. */
   problem?: string;
 }
@@ -513,10 +517,7 @@ function selectFirefoxProfile(
     // Profile dirs are `<salt>.<name>`; `Crash Reports` and friends are not.
     available.push(...dirs.filter((d) => d.includes('.')));
     for (const dir of dirs) {
-      const dot = dir.indexOf('.');
-      if (sameName(dir, profile) || (dot >= 0 && sameName(dir.slice(dot + 1), profile))) {
-        paths.add(join(profilesDir, dir));
-      }
+      if (matchesFirefoxProfileName(dir, profile)) paths.add(join(profilesDir, dir));
     }
     for (const entry of firefoxIniProfiles(join(root, 'profiles.ini'))) {
       if (sameName(entry.name, profile)) {
@@ -525,6 +526,32 @@ function selectFirefoxProfile(
     }
   }
   return { paths: [...paths], existingRoots, available };
+}
+
+/**
+ * The same browser rooted at a custom `--browser-data-dir` instead of its
+ * platform defaults. A Firefox profiles root may keep its profiles directly
+ * (Linux layout) or under `Profiles/` (macOS layout); both are searched, with
+ * `profiles.ini` read from the root either way. Safari never gets here.
+ */
+function customLocation(location: BrowserLocation, dataDir: string): BrowserLocation {
+  switch (location.kind) {
+    case 'chromium':
+    case 'opera':
+      return { ...location, userDataDirs: [dataDir] };
+    case 'firefox': {
+      const nested = join(dataDir, 'Profiles');
+      return {
+        ...location,
+        installs: [
+          { root: dataDir, profilesDir: dataDir },
+          ...(listDir(nested) ? [{ root: dataDir, profilesDir: nested }] : []),
+        ],
+      };
+    }
+    case 'safari':
+      return location;
+  }
 }
 
 /** Every root directory a location would read from, for the "not found" message. */
@@ -561,11 +588,38 @@ export function resolveBrowserSelection(
     browser,
     ...(selection.profile ? { profile: selection.profile } : {}),
   };
-  const location = browserLocations(opts).find((l) => l.id === selection.browser);
-  if (!location) {
+  const platformLocation = browserLocations(opts).find((l) => l.id === selection.browser);
+  if (!platformLocation) {
     report.problem = `${browser} is not supported on this platform (${platform}).`;
     return { configs: [], report };
   }
+  if (selection.dataDir) {
+    report.dataDir = selection.dataDir;
+    if (platformLocation.kind === 'safari') {
+      report.problem = 'Safari does not support a custom data directory.';
+      return { configs: [], report };
+    }
+    if (platformLocation.kind === 'firefox' && isFirefoxProfileDir(selection.dataDir)) {
+      // A single profile: it IS the selection (parse already refused a
+      // --browser-profile that names a different one).
+      if (
+        selection.profile &&
+        !matchesFirefoxProfileName(basename(selection.dataDir), selection.profile)
+      ) {
+        report.problem =
+          `The data directory is the Firefox profile "${basename(selection.dataDir)}", ` +
+          `not "${selection.profile}".`;
+        return { configs: [], report };
+      }
+      return {
+        configs: [{ name: browser, paths: [selection.dataDir], type: 'firefox-profile' }],
+        report,
+      };
+    }
+  }
+  const location = selection.dataDir
+    ? customLocation(platformLocation, selection.dataDir)
+    : platformLocation;
 
   const roots = locationRoots(location);
   const notFound = `${browser}'s data directory was not found (checked: ${roots.join(', ')}).`;
@@ -852,6 +906,7 @@ function browsersToSearch(
         label: describeBrowserSelection(selection),
         browser: name,
         ...(selection.profile ? { profile: selection.profile } : {}),
+        ...(selection.dataDir ? { dataDir: selection.dataDir } : {}),
       },
     };
   }

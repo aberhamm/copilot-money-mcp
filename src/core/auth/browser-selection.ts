@@ -1,3 +1,8 @@
+import { existsSync, statSync } from 'fs';
+import { homedir } from 'os';
+import { basename, join, resolve } from 'path';
+import { retryInterrupted } from '../fs-retry.js';
+
 /**
  * Explicit browser / profile selection for `--live-reads` / `--write` auth.
  *
@@ -7,6 +12,9 @@
  * every time, whoever happens to come first. `--browser` / `--browser-profile`
  * (or `COPILOT_BROWSER` / `COPILOT_BROWSER_PROFILE`) pin the search to exactly
  * one browser, and optionally one profile of it, with no fallback.
+ *
+ * `--browser-data-dir` (`COPILOT_BROWSER_DATA_DIR`) points the selected
+ * browser at a custom user-data root instead of its platform defaults.
  *
  * This module only resolves and validates the selection. Where each browser
  * keeps its data, and how a profile name maps to a directory, live in
@@ -74,6 +82,11 @@ export interface BrowserSelection {
   browser: BrowserId;
   /** Profile directory name or display name; undefined = every profile. */
   profile?: string;
+  /**
+   * Absolute user-data root replacing the browser's platform defaults
+   * (Firefox: a profiles root, or one profile directory).
+   */
+  dataDir?: string;
 }
 
 /** A selection that cannot be honoured. The CLI turns this into exit 1. */
@@ -118,10 +131,54 @@ export interface BrowserSelectionInput {
   browserFlag?: string;
   /** `--browser-profile` value, if the flag was given. */
   profileFlag?: string;
-  /** Environment to read `COPILOT_BROWSER` / `COPILOT_BROWSER_PROFILE` from. */
+  /** `--browser-data-dir` value, if the flag was given. */
+  dataDirFlag?: string;
+  /** Environment to read the `COPILOT_BROWSER*` variables from. */
   env?: Record<string, string | undefined>;
   /** Platform to validate against; defaults to `process.platform`. */
   platform?: NodeJS.Platform;
+  /** Base for a relative data dir; defaults to `process.cwd()`. */
+  cwd?: string;
+  /** Expansion of a leading `~`; defaults to `os.homedir()`. */
+  home?: string;
+  /** What is at a path; defaults to a (retried) `statSync`. */
+  pathKind?: (path: string) => PathKind;
+}
+
+/** What {@link BrowserSelectionInput.pathKind} reports for a path. */
+export type PathKind = 'directory' | 'file' | 'missing';
+
+function statPathKind(path: string): PathKind {
+  try {
+    return retryInterrupted(() => statSync(path)).isDirectory() ? 'directory' : 'file';
+  } catch {
+    return 'missing';
+  }
+}
+
+/** Expand a leading `~` / `~/` and resolve a relative path against `cwd`. */
+export function resolveDataDirPath(raw: string, cwd: string, home: string): string {
+  const expanded = raw === '~' ? home : /^~[/\\]/.test(raw) ? join(home, raw.slice(2)) : raw;
+  return resolve(cwd, expanded);
+}
+
+/**
+ * True when `dir` is itself a Firefox profile rather than a profiles root:
+ * it holds `storage/default`, `prefs.js` or `times.json`.
+ */
+export function isFirefoxProfileDir(dir: string): boolean {
+  return ['storage/default', 'prefs.js', 'times.json'].some((entry) =>
+    existsSync(join(dir, entry))
+  );
+}
+
+/** A Firefox profile dir name matches by itself or by its part after the first dot. */
+export function matchesFirefoxProfileName(dirName: string, profile: string): boolean {
+  const lower = profile.toLowerCase();
+  const dot = dirName.indexOf('.');
+  return (
+    dirName.toLowerCase() === lower || (dot >= 0 && dirName.slice(dot + 1).toLowerCase() === lower)
+  );
 }
 
 /** Treat an empty or whitespace-only value as "not given". */
@@ -145,12 +202,19 @@ export function parseBrowserSelection(input: BrowserSelectionInput): BrowserSele
   const platform = input.platform ?? process.platform;
   const browserName = present(input.browserFlag) ?? present(env.COPILOT_BROWSER);
   const profile = present(input.profileFlag) ?? present(env.COPILOT_BROWSER_PROFILE);
+  const rawDataDir = present(input.dataDirFlag) ?? present(env.COPILOT_BROWSER_DATA_DIR);
 
   if (!browserName) {
     if (profile) {
       throw new BrowserSelectionError(
         '--browser-profile (COPILOT_BROWSER_PROFILE) requires --browser (COPILOT_BROWSER): ' +
           'a profile name only means something within one browser.'
+      );
+    }
+    if (rawDataDir) {
+      throw new BrowserSelectionError(
+        '--browser-data-dir (COPILOT_BROWSER_DATA_DIR) requires --browser (COPILOT_BROWSER): ' +
+          'say which browser the data directory belongs to.'
       );
     }
     return undefined;
@@ -166,11 +230,53 @@ export function parseBrowserSelection(input: BrowserSelectionInput): BrowserSele
       `${display} has no selectable profiles; drop --browser-profile (COPILOT_BROWSER_PROFILE).`
     );
   }
-  return profile ? { browser, profile } : { browser };
+
+  let dataDir: string | undefined;
+  if (rawDataDir) {
+    if (browser === 'safari') {
+      throw new BrowserSelectionError(
+        'Safari does not support --browser-data-dir (COPILOT_BROWSER_DATA_DIR): ' +
+          'its website-data locations are fixed by macOS.'
+      );
+    }
+    dataDir = resolveDataDirPath(rawDataDir, input.cwd ?? process.cwd(), input.home ?? homedir());
+    const kind = (input.pathKind ?? statPathKind)(dataDir);
+    if (kind !== 'directory') {
+      throw new BrowserSelectionError(
+        `--browser-data-dir (COPILOT_BROWSER_DATA_DIR) "${dataDir}" ` +
+          (kind === 'missing' ? 'does not exist.' : 'is not a directory.')
+      );
+    }
+    if (
+      browser === 'firefox' &&
+      profile &&
+      isFirefoxProfileDir(dataDir) &&
+      !matchesFirefoxProfileName(basename(dataDir), profile)
+    ) {
+      throw new BrowserSelectionError(
+        `--browser-data-dir "${dataDir}" is a single Firefox profile ("${basename(dataDir)}"), ` +
+          `which does not match --browser-profile "${profile}". Drop --browser-profile, or ` +
+          'point --browser-data-dir at the profiles root.'
+      );
+    }
+  }
+
+  return {
+    browser,
+    ...(profile ? { profile } : {}),
+    ...(dataDir ? { dataDir } : {}),
+  };
 }
 
-/** Human-readable label, e.g. `Brave (profile "Default")`. */
+/**
+ * Human-readable label, e.g. `Brave (profile "Default")` or
+ * `Chrome (profile "Work", data dir "/home/me/chrome")`.
+ */
 export function describeBrowserSelection(selection: BrowserSelection): string {
   const display = BROWSER_DISPLAY_NAMES[selection.browser];
-  return selection.profile ? `${display} (profile "${selection.profile}")` : display;
+  const details = [
+    ...(selection.profile ? [`profile "${selection.profile}"`] : []),
+    ...(selection.dataDir ? [`data dir "${selection.dataDir}"`] : []),
+  ];
+  return details.length ? `${display} (${details.join(', ')})` : display;
 }

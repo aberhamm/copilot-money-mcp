@@ -19,6 +19,7 @@ import { homedir, tmpdir } from 'os';
 import {
   BROWSER_IDS,
   BrowserSelectionError,
+  describeBrowserSelection,
   parseBrowserSelection,
   resolveBrowserName,
   validBrowserNames,
@@ -591,5 +592,246 @@ describe('noCopilotSessionError', () => {
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
+  });
+});
+
+describe('--browser-data-dir', () => {
+  let home: string;
+  let custom: string;
+
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), 'browser-datadir-home-'));
+    custom = join(home, 'chrome-profile/Fork-18');
+    mkdirSync(custom, { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  const parse = (input: Parameters<typeof parseBrowserSelection>[0]) =>
+    parseBrowserSelection({ env: {}, platform: 'linux', cwd: home, home, ...input });
+
+  const linux = (selection: NonNullable<ReturnType<typeof parseBrowserSelection>>) =>
+    extractRefreshTokenCandidates(undefined, { platform: 'linux', home, env: {}, selection });
+
+  describe('parsing', () => {
+    test('the flag wins over COPILOT_BROWSER_DATA_DIR', () => {
+      const other = join(home, 'other');
+      mkdirSync(other);
+      expect(
+        parse({
+          browserFlag: 'chrome',
+          dataDirFlag: custom,
+          env: { COPILOT_BROWSER_DATA_DIR: other },
+        })
+      ).toEqual({ browser: 'chrome', dataDir: custom });
+      expect(
+        parse({ env: { COPILOT_BROWSER: 'chrome', COPILOT_BROWSER_DATA_DIR: other } })
+      ).toEqual({ browser: 'chrome', dataDir: other });
+    });
+
+    test('an empty value counts as unset', () => {
+      expect(parse({ browserFlag: 'chrome', env: { COPILOT_BROWSER_DATA_DIR: '  ' } })).toEqual({
+        browser: 'chrome',
+      });
+    });
+
+    test('requires a browser', () => {
+      expect(() => parse({ dataDirFlag: custom })).toThrow(
+        /--browser-data-dir \(COPILOT_BROWSER_DATA_DIR\) requires --browser/
+      );
+      expect(() => parse({ env: { COPILOT_BROWSER_DATA_DIR: custom } })).toThrow(
+        BrowserSelectionError
+      );
+    });
+
+    test('a missing path or a file is refused at parse time', () => {
+      const missing = join(home, 'nope');
+      expect(() => parse({ browserFlag: 'chrome', dataDirFlag: missing })).toThrow(
+        `"${missing}" does not exist.`
+      );
+      const file = join(home, 'file');
+      writeFileSync(file, 'x');
+      expect(() => parse({ browserFlag: 'chrome', dataDirFlag: file })).toThrow(
+        'is not a directory.'
+      );
+    });
+
+    test('the existence check is injectable', () => {
+      const seen: string[] = [];
+      expect(
+        parse({
+          browserFlag: 'brave',
+          dataDirFlag: '/virtual/brave',
+          pathKind: (p) => {
+            seen.push(p);
+            return 'directory';
+          },
+        })
+      ).toEqual({ browser: 'brave', dataDir: '/virtual/brave' });
+      expect(seen).toEqual(['/virtual/brave']);
+      expect(() =>
+        parse({ browserFlag: 'brave', dataDirFlag: '/virtual/x', pathKind: () => 'missing' })
+      ).toThrow('does not exist');
+    });
+
+    test('a leading ~ expands to home and a relative path resolves against cwd', () => {
+      const ok = () => 'directory' as const;
+      expect(
+        parse({ browserFlag: 'chrome', dataDirFlag: '~/chrome-profile/Fork-18', pathKind: ok })
+          ?.dataDir
+      ).toBe(custom);
+      expect(parse({ browserFlag: 'chrome', dataDirFlag: '~', pathKind: ok })?.dataDir).toBe(home);
+      expect(
+        parse({ browserFlag: 'chrome', dataDirFlag: 'chrome-profile/Fork-18', pathKind: ok })
+          ?.dataDir
+      ).toBe(custom);
+      expect(
+        parse({
+          browserFlag: 'chrome',
+          dataDirFlag: './x/../chrome-profile/Fork-18',
+          cwd: home,
+          pathKind: ok,
+        })?.dataDir
+      ).toBe(custom);
+    });
+
+    test('Safari refuses a data dir', () => {
+      expect(() =>
+        parseBrowserSelection({
+          browserFlag: 'safari',
+          dataDirFlag: custom,
+          env: {},
+          platform: 'darwin',
+        })
+      ).toThrow(/Safari does not support --browser-data-dir/);
+    });
+
+    test('a direct Firefox profile dir with a non-matching --browser-profile is refused', () => {
+      const profileDir = join(home, 'ff/abc.default-release');
+      mkdirSync(profileDir, { recursive: true });
+      writeFileSync(join(profileDir, 'prefs.js'), '');
+      expect(() =>
+        parse({ browserFlag: 'firefox', dataDirFlag: profileDir, profileFlag: 'work' })
+      ).toThrow(/is a single Firefox profile \("abc\.default-release"\).*"work"/);
+      expect(
+        parse({ browserFlag: 'firefox', dataDirFlag: profileDir, profileFlag: 'default-release' })
+      ).toEqual({ browser: 'firefox', profile: 'default-release', dataDir: profileDir });
+    });
+
+    test('the label names the data dir', () => {
+      expect(describeBrowserSelection({ browser: 'chrome', dataDir: '/d' })).toBe(
+        'Chrome (data dir "/d")'
+      );
+      expect(describeBrowserSelection({ browser: 'chrome', profile: 'Work', dataDir: '/d' })).toBe(
+        'Chrome (profile "Work", data dir "/d")'
+      );
+    });
+  });
+
+  describe('extraction', () => {
+    test('Chromium: the custom root is searched and the default location is not', async () => {
+      plantChromium(custom, 'Default', fakeToken('custom'));
+      plantChromium(join(home, '.config/google-chrome'), 'Default', fakeToken('default'));
+
+      const result = await linux({ browser: 'chrome', dataDir: custom });
+      expect(result.checked).toEqual(['Chrome']);
+      expect(result.candidates.map((c) => c.token)).toEqual([fakeToken('custom')]);
+      expect(result.selection?.label).toBe(`Chrome (data dir "${custom}")`);
+      expect(result.selection?.dataDir).toBe(custom);
+    });
+
+    test('Chromium: custom root + profile by directory name', async () => {
+      plantChromium(custom, 'Default', fakeToken('a'));
+      plantChromium(custom, 'Profile 4', fakeToken('b'));
+      const result = await linux({ browser: 'chrome', profile: 'profile 4', dataDir: custom });
+      expect(result.candidates.map((c) => c.token)).toEqual([fakeToken('b')]);
+    });
+
+    test('Chromium: custom root + profile by Local State display name', async () => {
+      plantChromium(custom, 'Default', fakeToken('a'));
+      plantChromium(custom, 'Profile 1', fakeToken('b'));
+      writeLocalState(custom, { Default: { name: 'Person A' }, 'Profile 1': { name: 'Fork' } });
+      // The default location's Local State must not be consulted.
+      writeLocalState(join(home, '.config/google-chrome'), { Default: { name: 'Fork' } });
+      const result = await linux({ browser: 'chrome', profile: 'FORK', dataDir: custom });
+      expect(result.candidates.map((c) => c.token)).toEqual([fakeToken('b')]);
+    });
+
+    test('Opera: the custom root keeps the root-layout storage', async () => {
+      const dir = join(custom, IDB);
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, '000001.ldb'), fakeToken('opera'));
+      const result = await linux({ browser: 'opera', dataDir: custom });
+      expect(result.candidates.map((c) => c.token)).toEqual([fakeToken('opera')]);
+    });
+
+    test('Firefox: a profiles root, with profiles.ini relative paths resolved against it', async () => {
+      const root = join(home, 'ff-root');
+      plantFirefox(join(root, 'Profiles'), 'q1.default-release', fakeToken('nested'));
+      plantFirefox(root, 'q2.side', fakeToken('flat'));
+      writeFileSync(
+        join(root, 'profiles.ini'),
+        '[Profile0]\nName=Main\nIsRelative=1\nPath=Profiles/q1.default-release\n\n' +
+          '[Profile1]\nName=Side\nIsRelative=1\nPath=q2.side\n'
+      );
+      plantFirefox(join(home, '.mozilla/firefox'), 'z.default', fakeToken('default'));
+
+      const all = await linux({ browser: 'firefox', dataDir: root });
+      expect(all.candidates.map((c) => c.token).sort()).toEqual(
+        [fakeToken('flat'), fakeToken('nested')].sort()
+      );
+      const main = await linux({ browser: 'firefox', profile: 'main', dataDir: root });
+      expect(main.candidates.map((c) => c.token)).toEqual([fakeToken('nested')]);
+      const side = await linux({ browser: 'firefox', profile: 'side', dataDir: root });
+      expect(side.candidates.map((c) => c.token)).toEqual([fakeToken('flat')]);
+    });
+
+    test('Firefox: a direct profile dir is searched on its own, no profile needed', async () => {
+      const profiles = join(home, 'ff-direct');
+      plantFirefox(profiles, 'p1.default', fakeToken('direct'));
+      plantFirefox(profiles, 'p2.other', fakeToken('sibling'));
+      const profileDir = join(profiles, 'p1.default');
+
+      const result = await linux({ browser: 'firefox', dataDir: profileDir });
+      expect(result.candidates.map((c) => c.token)).toEqual([fakeToken('direct')]);
+      const named = await linux({ browser: 'firefox', profile: 'default', dataDir: profileDir });
+      expect(named.candidates.map((c) => c.token)).toEqual([fakeToken('direct')]);
+      const wrong = await linux({ browser: 'firefox', profile: 'other', dataDir: profileDir });
+      expect(wrong.candidates).toEqual([]);
+      expect(wrong.selection?.problem).toContain('is the Firefox profile "p1.default"');
+    });
+
+    test('Safari: a data dir reaching extraction finds nothing and says why', async () => {
+      plantChromium(custom, 'Default', fakeToken('x'));
+      const result = await extractRefreshTokenCandidates(undefined, {
+        platform: 'darwin',
+        home,
+        env: {},
+        selection: { browser: 'safari', dataDir: custom },
+      });
+      expect(result.candidates).toEqual([]);
+      expect(result.selection?.problem).toBe('Safari does not support a custom data directory.');
+    });
+
+    test('no session in the custom dir: the error names it, with no fallback', async () => {
+      plantChromium(join(home, '.config/google-chrome'), 'Default', fakeToken('default'));
+      mkdirSync(join(custom, 'Default'), { recursive: true });
+
+      const result = await linux({ browser: 'chrome', dataDir: custom });
+      expect(result.candidates).toEqual([]);
+      const message = noCopilotSessionError(result.checked, result.selection).message;
+      expect(message).toContain(`No Copilot Money session found in Chrome (data dir "${custom}").`);
+      expect(message).not.toContain(fakeToken('default'));
+    });
+
+    test('a data dir removed after startup is reported as missing', async () => {
+      const gone = join(home, 'gone');
+      const result = await linux({ browser: 'chrome', profile: 'Default', dataDir: gone });
+      const message = noCopilotSessionError(result.checked, result.selection).message;
+      expect(message).toContain(`Chrome (profile "Default", data dir "${gone}")`);
+      expect(message).toContain(`Chrome's data directory was not found (checked: ${gone}).`);
+    });
   });
 });

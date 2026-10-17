@@ -37,6 +37,7 @@ function parseArgs(): {
   let liveReadsEnabled = false;
   let browserFlag: string | undefined;
   let profileFlag: string | undefined;
+  let dataDirFlag: string | undefined;
 
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
@@ -62,13 +63,14 @@ function parseArgs(): {
       writeFlagSeen = true;
     } else if (arg === '--live-reads') {
       liveReadsEnabled = true;
-    } else if (arg === '--browser' || arg === '--browser-profile') {
+    } else if (arg === '--browser' || arg === '--browser-profile' || arg === '--browser-data-dir') {
       const value = args[i + 1];
       if (value === undefined || value.startsWith('--') || !value.trim()) {
         failArgs(`${arg} requires a value`);
       }
       if (arg === '--browser') browserFlag = value;
-      else profileFlag = value;
+      else if (arg === '--browser-profile') profileFlag = value;
+      else dataDirFlag = value;
       i++;
     } else if (arg === '--help' || arg === '-h') {
       console.error(`
@@ -88,6 +90,10 @@ Options:
                       With --browser: read only this profile — a directory name
                       ("Default", "Profile 2") or the profile's display name
                       (Firefox: directory, its suffix like "default-release", or profiles.ini Name)
+  --browser-data-dir <path>
+                      With --browser: use this user-data root instead of the browser's default
+                      locations (the folder holding "Local State" and Default/Profile N; Firefox:
+                      a profiles root or a single profile dir). Not supported for Safari.
   --verbose, -v       Enable verbose logging
   --help, -h          Show this help message
 
@@ -96,6 +102,8 @@ Environment:
   COPILOT_BROWSER     Same as --browser (the flag wins)
   COPILOT_BROWSER_PROFILE
                       Same as --browser-profile (the flag wins)
+  COPILOT_BROWSER_DATA_DIR
+                      Same as --browser-data-dir (the flag wins)
   The server uses stdio transport and logs to stderr.
   Claude Desktop will communicate with it via stdin/stdout.
 `);
@@ -109,7 +117,7 @@ Environment:
 
   let browserSelection: BrowserSelection | undefined;
   try {
-    browserSelection = parseBrowserSelection({ browserFlag, profileFlag });
+    browserSelection = parseBrowserSelection({ browserFlag, profileFlag, dataDirFlag });
   } catch (err) {
     if (err instanceof BrowserSelectionError) failArgs(err.message);
     throw err;
