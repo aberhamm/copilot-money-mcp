@@ -3,19 +3,33 @@
  *
  * Searches Chromium browsers (Chrome, Arc, Edge, Brave, Vivaldi, Chromium,
  * Opera, Opera GX), Safari, and Firefox LevelDB/IndexedDB storage for Copilot
- * Money Firebase refresh tokens (prefixed with "AMf-").
+ * Money Firebase refresh tokens (prefixed with "AMf-"). macOS locations are
+ * the default; on Linux the Linux ones are searched instead. An explicit
+ * `--browser` / `--browser-profile` selection (see `browser-selection.ts`)
+ * restricts the search to one browser and profile.
  */
 
-import { readdirSync, readFileSync, existsSync, statSync } from 'fs';
-import { join } from 'path';
+import { readdirSync, readFileSync, existsSync, statSync, type Dirent } from 'fs';
+import { isAbsolute, join } from 'path';
 import { homedir } from 'os';
 import { retryInterrupted } from '../fs-retry.js';
+import {
+  BROWSER_DISPLAY_NAMES,
+  describeBrowserSelection,
+  type BrowserId,
+  type BrowserSelection,
+} from './browser-selection.js';
 
 /** Configuration for a browser's token storage location. */
 export interface BrowserConfig {
   name: string;
   paths: string[];
-  type: 'chromium' | 'safari' | 'firefox';
+  /**
+   * `firefox` paths are profiles roots (every profile under each is searched);
+   * `firefox-profile` paths are single profile directories, which is what a
+   * `--browser-profile` selection resolves to.
+   */
+  type: 'chromium' | 'safari' | 'firefox' | 'firefox-profile';
 }
 
 /** Result of a successful token extraction. */
@@ -54,6 +68,11 @@ export interface TokenCandidates {
   candidates: TokenResult[];
   /** Browser names searched, in order — used to build the "no session" error. */
   checked: string[];
+  /**
+   * Present only for an explicit `--browser` selection: what was searched and,
+   * if it was missing on disk, why — so the "no session" error can name it.
+   */
+  selection?: SelectionReport;
 }
 
 /** Firebase refresh token regex: AMf- followed by 100+ URL-safe base64 chars. */
@@ -152,19 +171,44 @@ export function getChromiumProfileStoragePaths(userDataDir: string): string[] {
 }
 
 /**
+ * Where one browser keeps its data on one platform, before it is turned into
+ * the flat search-path list a {@link BrowserConfig} carries. Kept separately
+ * because selecting a profile needs the user-data roots, which the flat list
+ * has already expanded away.
+ */
+type BrowserLocation =
+  | {
+      id: BrowserId;
+      /**
+       * `chromium`: Chrome's `Default` / `Profile N` layout. `opera`: the
+       * same, plus the storage dirs directly under the root (see
+       * OPERA_USER_DATA_DIRS).
+       */
+      kind: 'chromium' | 'opera';
+      userDataDirs: string[];
+    }
+  | { id: BrowserId; kind: 'safari'; paths: string[] }
+  | {
+      id: BrowserId;
+      kind: 'firefox';
+      /** `root` holds `profiles.ini`; `profilesDir` holds the profile dirs. */
+      installs: Array<{ root: string; profilesDir: string }>;
+    };
+
+/**
  * Chromium-based browsers that use the standard Chrome user-data layout
  * (`Default` / `Profile N` subdirectories), keyed to their macOS user-data
  * directory relative to the home folder. They all store Copilot's Firebase
  * Web SDK session under per-profile IndexedDB/Local Storage, so they share
  * getChromiumProfileStoragePaths for multi-profile discovery.
  */
-const CHROMIUM_USER_DATA_DIRS: ReadonlyArray<{ name: string; userDataDir: string }> = [
-  { name: 'Chrome', userDataDir: 'Library/Application Support/Google/Chrome' },
-  { name: 'Arc', userDataDir: 'Library/Application Support/Arc/User Data' },
-  { name: 'Microsoft Edge', userDataDir: 'Library/Application Support/Microsoft Edge' },
-  { name: 'Brave', userDataDir: 'Library/Application Support/BraveSoftware/Brave-Browser' },
-  { name: 'Vivaldi', userDataDir: 'Library/Application Support/Vivaldi' },
-  { name: 'Chromium', userDataDir: 'Library/Application Support/Chromium' },
+const CHROMIUM_USER_DATA_DIRS: ReadonlyArray<{ id: BrowserId; userDataDir: string }> = [
+  { id: 'chrome', userDataDir: 'Library/Application Support/Google/Chrome' },
+  { id: 'arc', userDataDir: 'Library/Application Support/Arc/User Data' },
+  { id: 'edge', userDataDir: 'Library/Application Support/Microsoft Edge' },
+  { id: 'brave', userDataDir: 'Library/Application Support/BraveSoftware/Brave-Browser' },
+  { id: 'vivaldi', userDataDir: 'Library/Application Support/Vivaldi' },
+  { id: 'chromium', userDataDir: 'Library/Application Support/Chromium' },
 ];
 
 /**
@@ -175,50 +219,387 @@ const CHROMIUM_USER_DATA_DIRS: ReadonlyArray<{ name: string; userDataDir: string
  * user-data root plus the standard per-profile paths. Non-existent paths are
  * skipped cheaply at search time.
  */
-const OPERA_USER_DATA_DIRS: ReadonlyArray<{ name: string; userDataDir: string }> = [
-  { name: 'Opera', userDataDir: 'Library/Application Support/com.operasoftware.Opera' },
-  { name: 'Opera GX', userDataDir: 'Library/Application Support/com.operasoftware.OperaGX' },
+const OPERA_USER_DATA_DIRS: ReadonlyArray<{ id: BrowserId; userDataDir: string }> = [
+  { id: 'opera', userDataDir: 'Library/Application Support/com.operasoftware.Opera' },
+  { id: 'opera-gx', userDataDir: 'Library/Application Support/com.operasoftware.OperaGX' },
 ];
 
-/** Default browser configurations for macOS. */
-export const BROWSER_CONFIGS: BrowserConfig[] = [
-  ...CHROMIUM_USER_DATA_DIRS.map(({ name, userDataDir }): BrowserConfig => ({
-    name,
-    paths: getChromiumProfileStoragePaths(join(homedir(), userDataDir)),
-    type: 'chromium',
-  })),
-  ...OPERA_USER_DATA_DIRS.map(({ name, userDataDir }): BrowserConfig => {
-    const root = join(homedir(), userDataDir);
-    return {
-      name,
-      // Root layout (older builds) first, then the Chrome-style Default/Profile
-      // N layout (recent builds) via the shared multi-profile discovery.
+/** macOS locations — the original, and still the non-Linux default, table. */
+function macosLocations(home: string): BrowserLocation[] {
+  const firefoxRoot = join(home, 'Library/Application Support/Firefox');
+  return [
+    ...CHROMIUM_USER_DATA_DIRS.map(({ id, userDataDir }): BrowserLocation => ({
+      id,
+      kind: 'chromium',
+      userDataDirs: [join(home, userDataDir)],
+    })),
+    ...OPERA_USER_DATA_DIRS.map(({ id, userDataDir }): BrowserLocation => ({
+      id,
+      kind: 'opera',
+      userDataDirs: [join(home, userDataDir)],
+    })),
+    {
+      id: 'safari',
+      kind: 'safari',
       paths: [
-        join(root, COPILOT_INDEXEDDB_DIR),
-        join(root, LOCAL_STORAGE_DIR),
-        ...getChromiumProfileStoragePaths(root),
+        // Safari 17+ stores IndexedDB in the app container with hashed directory names
+        join(home, 'Library/Containers/com.apple.Safari/Data/Library/WebKit/WebsiteData/Default'),
+        join(home, 'Library/Safari/Databases'),
       ],
-      type: 'chromium',
-    };
-  }),
-  {
-    name: 'Safari',
-    paths: [
-      // Safari 17+ stores IndexedDB in the app container with hashed directory names
-      join(
-        homedir(),
-        'Library/Containers/com.apple.Safari/Data/Library/WebKit/WebsiteData/Default'
-      ),
-      join(homedir(), 'Library/Safari/Databases'),
+    },
+    {
+      id: 'firefox',
+      kind: 'firefox',
+      installs: [{ root: firefoxRoot, profilesDir: join(firefoxRoot, 'Profiles') }],
+    },
+  ];
+}
+
+/**
+ * Linux locations. Arc, Safari and Opera GX do not exist there. The
+ * `~/.config` ones honour `XDG_CONFIG_HOME` (only when absolute, as the XDG
+ * spec requires); the snap and flatpak sandboxes keep their own trees.
+ * Firefox keeps `profiles.ini` and the profile dirs side by side, so `root`
+ * and `profilesDir` are the same directory.
+ */
+function linuxLocations(home: string, env: Record<string, string | undefined>): BrowserLocation[] {
+  const xdg = env.XDG_CONFIG_HOME;
+  const config = xdg && isAbsolute(xdg) ? xdg : join(home, '.config');
+  const firefox = (dir: string): { root: string; profilesDir: string } => ({
+    root: dir,
+    profilesDir: dir,
+  });
+  return [
+    {
+      id: 'chrome',
+      kind: 'chromium',
+      userDataDirs: [
+        join(config, 'google-chrome'),
+        join(config, 'google-chrome-beta'),
+        join(config, 'google-chrome-unstable'),
+      ],
+    },
+    { id: 'edge', kind: 'chromium', userDataDirs: [join(config, 'microsoft-edge')] },
+    {
+      id: 'brave',
+      kind: 'chromium',
+      userDataDirs: [join(config, 'BraveSoftware/Brave-Browser')],
+    },
+    { id: 'vivaldi', kind: 'chromium', userDataDirs: [join(config, 'vivaldi')] },
+    {
+      id: 'chromium',
+      kind: 'chromium',
+      userDataDirs: [join(config, 'chromium'), join(home, 'snap/chromium/common/chromium')],
+    },
+    { id: 'opera', kind: 'opera', userDataDirs: [join(config, 'opera')] },
+    {
+      id: 'firefox',
+      kind: 'firefox',
+      installs: [
+        firefox(join(home, '.mozilla/firefox')),
+        firefox(join(home, 'snap/firefox/common/.mozilla/firefox')),
+        firefox(join(home, '.var/app/org.mozilla.firefox/.mozilla/firefox')),
+      ],
+    },
+  ];
+}
+
+/** Platform, home and environment the browser tables are built from. */
+export interface BrowserEnvironment {
+  /** Defaults to `process.platform`. Anything but `linux` gets the macOS table. */
+  platform?: NodeJS.Platform;
+  /** Defaults to `os.homedir()`. */
+  home?: string;
+  /** Defaults to `process.env`; only `XDG_CONFIG_HOME` is read. */
+  env?: Record<string, string | undefined>;
+}
+
+function browserLocations(opts: BrowserEnvironment = {}): BrowserLocation[] {
+  const home = opts.home ?? homedir();
+  return (opts.platform ?? process.platform) === 'linux'
+    ? linuxLocations(home, opts.env ?? process.env)
+    : macosLocations(home);
+}
+
+/** The flat search list for one location, every profile included. */
+function locationToConfig(location: BrowserLocation): BrowserConfig {
+  const name = BROWSER_DISPLAY_NAMES[location.id];
+  switch (location.kind) {
+    case 'chromium':
+      return {
+        name,
+        paths: location.userDataDirs.flatMap(getChromiumProfileStoragePaths),
+        type: 'chromium',
+      };
+    case 'opera':
+      return {
+        name,
+        // Root layout (older builds) first, then the Chrome-style Default/Profile
+        // N layout (recent builds) via the shared multi-profile discovery.
+        paths: location.userDataDirs.flatMap((root) => [
+          join(root, COPILOT_INDEXEDDB_DIR),
+          join(root, LOCAL_STORAGE_DIR),
+          ...getChromiumProfileStoragePaths(root),
+        ]),
+        type: 'chromium',
+      };
+    case 'safari':
+      return { name, paths: location.paths, type: 'safari' };
+    case 'firefox':
+      return { name, paths: location.installs.map((i) => i.profilesDir), type: 'firefox' };
+  }
+}
+
+/**
+ * Browser search configs for a platform, in default search order.
+ *
+ * macOS (and every non-Linux platform, as before Linux support existed):
+ * Chrome, Arc, Edge, Brave, Vivaldi, Chromium, Opera, Opera GX, Safari,
+ * Firefox. Linux: Chrome, Edge, Brave, Vivaldi, Chromium, Opera, Firefox.
+ * Platform, home and environment are injectable so either table can be built
+ * and tested from any OS.
+ */
+export function getBrowserConfigs(opts: BrowserEnvironment = {}): BrowserConfig[] {
+  return browserLocations(opts).map(locationToConfig);
+}
+
+/** Default browser configurations for macOS. Kept for compatibility. */
+export const BROWSER_CONFIGS: BrowserConfig[] = getBrowserConfigs({ platform: 'darwin' });
+
+let linuxDefaultConfigs: BrowserConfig[] | undefined;
+
+/**
+ * What an extraction with no overrides and no selection searches. Outside
+ * Linux that is exactly {@link BROWSER_CONFIGS}, built once at module load,
+ * as it always was; on Linux the Linux table, built once on first use.
+ */
+function defaultBrowserConfigs(): BrowserConfig[] {
+  if (process.platform !== 'linux') return BROWSER_CONFIGS;
+  linuxDefaultConfigs ??= getBrowserConfigs();
+  return linuxDefaultConfigs;
+}
+
+/**
+ * Why an explicit selection may have nothing to search, carried to the "no
+ * session" error so it can name the browser and profile instead of a list.
+ */
+export interface SelectionReport {
+  /** e.g. `Brave` or `Brave (profile "Default")`. */
+  label: string;
+  /** Display name alone, e.g. `Brave`. */
+  browser: string;
+  profile?: string;
+  /** Set when the browser's data or the profile was not found on disk. */
+  problem?: string;
+}
+
+/** Directory entries, or null when the directory cannot be listed (absent). */
+function listDir(dir: string): Dirent[] | null {
+  try {
+    return retryInterrupted(() => readdirSync(dir, { withFileTypes: true }));
+  } catch {
+    return null;
+  }
+}
+
+function sameName(a: string, b: string): boolean {
+  return a.toLowerCase() === b.toLowerCase();
+}
+
+/**
+ * Profile display names from a Chromium user-data dir's `Local State`:
+ * `profile.info_cache[<dir>].name`. Nothing else in the file is used.
+ */
+function chromiumProfileDisplayNames(userDataDir: string): Map<string, string> {
+  const names = new Map<string, string>();
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(join(userDataDir, 'Local State'), 'utf8'));
+    const infoCache = (parsed as { profile?: { info_cache?: unknown } } | null)?.profile
+      ?.info_cache;
+    if (infoCache && typeof infoCache === 'object') {
+      for (const [dir, info] of Object.entries(infoCache as Record<string, unknown>)) {
+        const name = (info as { name?: unknown } | null)?.name;
+        if (typeof name === 'string') names.set(dir, name);
+      }
+    }
+  } catch {
+    /* No or unreadable Local State: directory names still match */
+  }
+  return names;
+}
+
+/** `[Profile*]` sections of a Firefox `profiles.ini`: Name, Path, IsRelative. */
+function firefoxIniProfiles(
+  iniPath: string
+): Array<{ name: string; path: string; isRelative: boolean }> {
+  let text: string;
+  try {
+    text = readFileSync(iniPath, 'utf8');
+  } catch {
+    return [];
+  }
+  const profiles: Array<{ name: string; path: string; isRelative: boolean }> = [];
+  let current: Record<string, string> | null = null;
+  const flush = (): void => {
+    if (current?.Name && current.Path) {
+      profiles.push({
+        name: current.Name,
+        path: current.Path,
+        isRelative: current.IsRelative !== '0',
+      });
+    }
+  };
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    const section = /^\[(.+)\]$/.exec(line);
+    if (section) {
+      flush();
+      current = /^Profile\d+$/i.test(section[1] as string) ? {} : null;
+      continue;
+    }
+    const eq = line.indexOf('=');
+    if (current && eq > 0) current[line.slice(0, eq).trim()] = line.slice(eq + 1).trim();
+  }
+  flush();
+  return profiles;
+}
+
+/** Search paths for the named profile of a Chromium/Opera location. */
+function selectChromiumProfile(
+  userDataDirs: string[],
+  profile: string
+): { paths: string[]; existingRoots: number; available: string[] } {
+  const paths: string[] = [];
+  const available: string[] = [];
+  let existingRoots = 0;
+  for (const userDataDir of userDataDirs) {
+    const entries = listDir(userDataDir);
+    if (!entries) continue;
+    existingRoots++;
+    const dirs = entries.filter((e) => e.isDirectory()).map((e) => e.name);
+    const displayNames = chromiumProfileDisplayNames(userDataDir);
+    available.push(
+      ...dirs.filter((d) => d === 'Default' || /^Profile \d+$/.test(d) || displayNames.has(d))
+    );
+    const matches = new Set(dirs.filter((d) => sameName(d, profile)));
+    if (matches.size === 0) {
+      for (const [dir, name] of displayNames) {
+        if (sameName(name, profile) && dirs.includes(dir)) matches.add(dir);
+      }
+    }
+    for (const dir of matches) {
+      paths.push(
+        join(userDataDir, dir, COPILOT_INDEXEDDB_DIR),
+        join(userDataDir, dir, LOCAL_STORAGE_DIR)
+      );
+    }
+  }
+  return { paths, existingRoots, available };
+}
+
+/** Profile directories for the named profile of a Firefox location. */
+function selectFirefoxProfile(
+  installs: Array<{ root: string; profilesDir: string }>,
+  profile: string
+): { paths: string[]; existingRoots: number; available: string[] } {
+  const paths = new Set<string>();
+  const available: string[] = [];
+  let existingRoots = 0;
+  for (const { root, profilesDir } of installs) {
+    const entries = listDir(profilesDir);
+    if (!entries) continue;
+    existingRoots++;
+    const dirs = entries.filter((e) => e.isDirectory()).map((e) => e.name);
+    // Profile dirs are `<salt>.<name>`; `Crash Reports` and friends are not.
+    available.push(...dirs.filter((d) => d.includes('.')));
+    for (const dir of dirs) {
+      const dot = dir.indexOf('.');
+      if (sameName(dir, profile) || (dot >= 0 && sameName(dir.slice(dot + 1), profile))) {
+        paths.add(join(profilesDir, dir));
+      }
+    }
+    for (const entry of firefoxIniProfiles(join(root, 'profiles.ini'))) {
+      if (sameName(entry.name, profile)) {
+        paths.add(entry.isRelative ? join(root, entry.path) : entry.path);
+      }
+    }
+  }
+  return { paths: [...paths], existingRoots, available };
+}
+
+/** Every root directory a location would read from, for the "not found" message. */
+function locationRoots(location: BrowserLocation): string[] {
+  switch (location.kind) {
+    case 'chromium':
+    case 'opera':
+      return location.userDataDirs;
+    case 'safari':
+      return location.paths;
+    case 'firefox':
+      return location.installs.map((i) => i.profilesDir);
+  }
+}
+
+/**
+ * Build the search config for an explicit selection: exactly one browser and,
+ * when a profile is named, exactly that profile. Never anything else — a
+ * selection that finds nothing reports why rather than widening the search.
+ *
+ * A Chromium profile matches by directory name (`Default`, `Profile 2`) or by
+ * the display name in `Local State`; a Firefox profile by directory name, the
+ * part of it after the first dot (`default-release`), or `Name=` in
+ * `profiles.ini`. All comparisons are case-insensitive.
+ */
+export function resolveBrowserSelection(
+  selection: BrowserSelection,
+  opts: BrowserEnvironment = {}
+): { configs: BrowserConfig[]; report: SelectionReport } {
+  const platform = opts.platform ?? process.platform;
+  const browser = BROWSER_DISPLAY_NAMES[selection.browser];
+  const report: SelectionReport = {
+    label: describeBrowserSelection(selection),
+    browser,
+    ...(selection.profile ? { profile: selection.profile } : {}),
+  };
+  const location = browserLocations(opts).find((l) => l.id === selection.browser);
+  if (!location) {
+    report.problem = `${browser} is not supported on this platform (${platform}).`;
+    return { configs: [], report };
+  }
+
+  const roots = locationRoots(location);
+  const notFound = `${browser}'s data directory was not found (checked: ${roots.join(', ')}).`;
+
+  if (!selection.profile || location.kind === 'safari') {
+    if (!roots.some((root) => listDir(root) !== null)) report.problem = notFound;
+    return { configs: [locationToConfig(location)], report };
+  }
+
+  const profile = selection.profile;
+  const picked =
+    location.kind === 'firefox'
+      ? selectFirefoxProfile(location.installs, profile)
+      : selectChromiumProfile(location.userDataDirs, profile);
+  if (picked.existingRoots === 0) {
+    report.problem = notFound;
+  } else if (picked.paths.length === 0) {
+    const available = [...new Set(picked.available)];
+    report.problem =
+      `No ${browser} profile named "${profile}" was found ` +
+      `(available: ${available.length ? available.join(', ') : 'none'}; ` +
+      `checked: ${roots.join(', ')}).`;
+  }
+  return {
+    configs: [
+      {
+        name: browser,
+        paths: picked.paths,
+        type: location.kind === 'firefox' ? 'firefox-profile' : 'chromium',
+      },
     ],
-    type: 'safari',
-  },
-  {
-    name: 'Firefox',
-    paths: [join(homedir(), 'Library/Application Support/Firefox/Profiles')],
-    type: 'firefox',
-  },
-];
+    report,
+  };
+}
 
 /**
  * Extract every refresh token from a file's raw bytes.
@@ -262,6 +643,30 @@ function searchLevelDBDir(dirPath: string): FoundToken[] {
   );
 }
 
+/**
+ * Search one Firefox profile directory, appending to `found`. Throws on an
+ * unreadable directory; the callers decide whether that ends the search.
+ */
+function searchFirefoxProfileInto(profileDir: string, found: FoundToken[]): void {
+  const idbBase = join(profileDir, 'storage/default');
+  if (!existsSync(idbBase)) return;
+  const origins = retryInterrupted(() => readdirSync(idbBase, { withFileTypes: true }))
+    .filter((d) => d.isDirectory() && d.name.includes('copilot'))
+    .map((d) => d.name);
+  for (const origin of origins) {
+    const idbDir = join(idbBase, origin, 'idb');
+    if (!existsSync(idbDir)) continue;
+    // The read filter above is `includes('copilot')`, which is looser than
+    // Copilot's actual origin — so classify on the origin dir, not on the
+    // fact that we read it. A `copilot-something-else.com` origin is still
+    // read (unchanged behaviour) but ranks with the browser-wide pool.
+    const scoped = isCopilotScopedPath(origin);
+    for (const file of retryInterrupted(() => readdirSync(idbDir))) {
+      found.push(...tokensInFile(join(idbDir, file)).map((token) => ({ token, scoped })));
+    }
+  }
+}
+
 /** Search Firefox profiles for refresh tokens. */
 function searchFirefoxProfiles(profilesDir: string): FoundToken[] {
   // No outer `existsSync` (#774): a missing directory throws ENOENT into the
@@ -273,24 +678,19 @@ function searchFirefoxProfiles(profilesDir: string): FoundToken[] {
       .filter((d) => d.isDirectory())
       .map((d) => d.name);
     for (const profile of profiles) {
-      const idbBase = join(profilesDir, profile, 'storage/default');
-      if (!existsSync(idbBase)) continue;
-      const origins = retryInterrupted(() => readdirSync(idbBase, { withFileTypes: true }))
-        .filter((d) => d.isDirectory() && d.name.includes('copilot'))
-        .map((d) => d.name);
-      for (const origin of origins) {
-        const idbDir = join(idbBase, origin, 'idb');
-        if (!existsSync(idbDir)) continue;
-        // The read filter above is `includes('copilot')`, which is looser than
-        // Copilot's actual origin — so classify on the origin dir, not on the
-        // fact that we read it. A `copilot-something-else.com` origin is still
-        // read (unchanged behaviour) but ranks with the browser-wide pool.
-        const scoped = isCopilotScopedPath(origin);
-        for (const file of retryInterrupted(() => readdirSync(idbDir))) {
-          found.push(...tokensInFile(join(idbDir, file)).map((token) => ({ token, scoped })));
-        }
-      }
+      searchFirefoxProfileInto(join(profilesDir, profile), found);
     }
+  } catch {
+    /* Skip */
+  }
+  return found;
+}
+
+/** Search a single, explicitly selected Firefox profile directory. */
+function searchFirefoxProfile(profileDir: string): FoundToken[] {
+  const found: FoundToken[] = [];
+  try {
+    searchFirefoxProfileInto(profileDir, found);
   } catch {
     /* Skip */
   }
@@ -337,7 +737,9 @@ function searchBrowser(browser: BrowserConfig): FoundToken[] {
       ? searchLevelDBDir
       : browser.type === 'firefox'
         ? searchFirefoxProfiles
-        : searchSafariDatabases;
+        : browser.type === 'firefox-profile'
+          ? searchFirefoxProfile
+          : searchSafariDatabases;
   return browser.paths.flatMap(search);
 }
 
@@ -348,8 +750,21 @@ function searchBrowser(browser: BrowserConfig): FoundToken[] {
  * firebase-auth.ts rejected them all with PROJECT_NUMBER_MISMATCH). Both states
  * mean the same thing to the user: log in. This is AUTH_FAILED /
  * user-action-required, never schema/API drift.
+ *
+ * With an explicit selection the message names that browser (and profile)
+ * instead of a list, says when its data was not on disk at all, and points at
+ * the flags — the search deliberately never fell back to another browser.
  */
-export function noCopilotSessionError(checked: string[]): Error {
+export function noCopilotSessionError(checked: string[], selection?: SelectionReport): Error {
+  if (selection) {
+    const problem = selection.problem ? ` ${selection.problem}` : '';
+    return new Error(
+      `No Copilot Money session found in ${selection.label}.${problem} ` +
+        `Please log into https://app.copilot.money in ${selection.label}, then try again — ` +
+        'or select a different browser/profile with --browser / --browser-profile ' +
+        '(COPILOT_BROWSER / COPILOT_BROWSER_PROFILE). Other browsers were not searched.'
+    );
+  }
   return new Error(
     `No Copilot Money session found. Searched: ${checked.join(', ')}. ` +
       'Please log into Copilot Money at https://app.copilot.money in your browser, then try again.'
@@ -404,6 +819,46 @@ export function orderByProvenance(candidates: readonly TokenResult[]): TokenResu
   return [...candidates.filter((c) => c.scoped), ...candidates.filter((c) => !c.scoped)];
 }
 
+/** Options for {@link extractRefreshTokenCandidates}. */
+export interface ExtractOptions extends BrowserEnvironment {
+  /** Restrict the search to one browser (and optionally one profile). */
+  selection?: BrowserSelection;
+}
+
+/**
+ * Which configs one extraction searches. Without a selection: the overrides,
+ * else the table for the injected platform, else the process default. With
+ * one, the selection is resolved afresh on every call, so a profile created
+ * after startup is found by the next cold extraction.
+ */
+function browsersToSearch(
+  browserOverrides: BrowserConfig[] | undefined,
+  opts: ExtractOptions
+): { browsers: BrowserConfig[]; selection?: SelectionReport } {
+  const { selection, ...environment } = opts;
+  if (!selection) {
+    const injected =
+      opts.platform !== undefined || opts.home !== undefined || opts.env !== undefined;
+    return {
+      browsers:
+        browserOverrides ?? (injected ? getBrowserConfigs(environment) : defaultBrowserConfigs()),
+    };
+  }
+  if (browserOverrides) {
+    const name = BROWSER_DISPLAY_NAMES[selection.browser];
+    return {
+      browsers: browserOverrides.filter((b) => b.name === name),
+      selection: {
+        label: describeBrowserSelection(selection),
+        browser: name,
+        ...(selection.profile ? { profile: selection.profile } : {}),
+      },
+    };
+  }
+  const { configs, report } = resolveBrowserSelection(selection, environment);
+  return { browsers: configs, selection: report };
+}
+
 /**
  * Extract ALL Firebase refresh-token candidates from browser local storage.
  *
@@ -431,7 +886,13 @@ export function orderByProvenance(candidates: readonly TokenResult[]): TokenResu
  * Nothing about WHICH files are read changes here — only the order candidates
  * come back in, and the provenance flag that explains that order.
  *
- * @param browserOverrides - Override browser configs for testing
+ * With `opts.selection` only the selected browser — and profile, if named —
+ * is searched, never any other (see {@link resolveBrowserSelection}), and the
+ * result carries a {@link SelectionReport} for the "no session" error.
+ *
+ * @param browserOverrides - Override browser configs for testing. With a
+ *   selection, narrowed to the config whose name is the selected browser's.
+ * @param opts - Selection, plus platform/home/env for building the tables.
  */
 // Returns a Promise (the TokenExtractor contract is async) but the body is
 // fully synchronous — all browser reads are sync readFileSync. It is NOT
@@ -439,9 +900,10 @@ export function orderByProvenance(candidates: readonly TokenResult[]): TokenResu
 // @typescript-eslint/require-await, so the explicit Promise.resolve() is the
 // lint-clean way to satisfy the async signature. (Reviewed: #482.)
 export function extractRefreshTokenCandidates(
-  browserOverrides?: BrowserConfig[]
+  browserOverrides?: BrowserConfig[],
+  opts: ExtractOptions = {}
 ): Promise<TokenCandidates> {
-  const browsers = browserOverrides ?? BROWSER_CONFIGS;
+  const { browsers, selection } = browsersToSearch(browserOverrides, opts);
   const checked: string[] = [];
   const found: TokenResult[] = [];
 
@@ -452,7 +914,8 @@ export function extractRefreshTokenCandidates(
     }
   }
 
-  return Promise.resolve({ candidates: orderByProvenance(dedupeByToken(found)), checked });
+  const candidates = orderByProvenance(dedupeByToken(found));
+  return Promise.resolve(selection ? { candidates, checked, selection } : { candidates, checked });
 }
 
 /**
@@ -467,13 +930,18 @@ export function extractRefreshTokenCandidates(
  * compatibility.
  *
  * @param browserOverrides - Override browser configs for testing
+ * @param opts - Same as {@link extractRefreshTokenCandidates}.
  * @throws Error if no token is found in any browser
  */
 export async function extractRefreshToken(
-  browserOverrides?: BrowserConfig[]
+  browserOverrides?: BrowserConfig[],
+  opts: ExtractOptions = {}
 ): Promise<TokenResult> {
-  const { candidates, checked } = await extractRefreshTokenCandidates(browserOverrides);
+  const { candidates, checked, selection } = await extractRefreshTokenCandidates(
+    browserOverrides,
+    opts
+  );
   const [first] = candidates;
-  if (!first) throw noCopilotSessionError(checked);
+  if (!first) throw noCopilotSessionError(checked, selection);
   return first;
 }

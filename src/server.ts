@@ -19,6 +19,7 @@ import { ALL_TOOL_DEFS, TOOL_REGISTRY, type LiveToolContext } from './tools/regi
 import { GraphQLClient, GraphQLError } from './core/graphql/client.js';
 import { FirebaseAuth } from './core/auth/firebase-auth.js';
 import { extractRefreshTokenCandidates } from './core/auth/browser-token.js';
+import type { BrowserSelection } from './core/auth/browser-selection.js';
 import { LiveCopilotDatabase, preflightLiveAuth } from './core/live-database.js';
 import { SplitParentStore } from './core/persistence/split-parent-store.js';
 import { defaultPersistenceDir } from './core/persistence/dir.js';
@@ -66,13 +67,16 @@ export class CopilotMoneyServer {
    *                If undefined, uses default Copilot Money location.
    * @param decodeTimeoutMs - Optional timeout for decode operations in milliseconds.
    * @param writeEnabled - If true, register write tools and enable GraphQL writes.
+   * @param browserSelection - Restrict browser-session auth to one browser
+   *   (and profile); ignored when a GraphQL client is injected.
    */
   constructor(
     dbPath?: string,
     decodeTimeoutMs?: number,
     writeEnabled = false,
     liveReadsEnabled = false,
-    injectedGraphqlClient?: GraphQLClient
+    injectedGraphqlClient?: GraphQLClient,
+    browserSelection?: BrowserSelection
   ) {
     this.db = new CopilotDatabase(dbPath, decodeTimeoutMs);
     this.writeEnabled = writeEnabled;
@@ -80,8 +84,7 @@ export class CopilotMoneyServer {
 
     let graphqlClient = injectedGraphqlClient;
     if ((writeEnabled || liveReadsEnabled) && !graphqlClient) {
-      const auth = new FirebaseAuth(() => extractRefreshTokenCandidates());
-      graphqlClient = new GraphQLClient(auth);
+      graphqlClient = defaultGraphQLClient(browserSelection);
     }
 
     let liveDb: LiveCopilotDatabase | undefined;
@@ -411,9 +414,19 @@ export async function preflightLiveAuthOrWarn(client: GraphQLClient): Promise<vo
   }
 }
 
-/** The real GraphQL client: browser-session auth against Copilot's endpoint. */
-function defaultGraphQLClient(): GraphQLClient {
-  return new GraphQLClient(new FirebaseAuth(() => extractRefreshTokenCandidates()));
+/**
+ * The real GraphQL client: browser-session auth against Copilot's endpoint,
+ * searching only `browserSelection`'s browser/profile when one is given.
+ */
+function defaultGraphQLClient(browserSelection?: BrowserSelection): GraphQLClient {
+  return new GraphQLClient(
+    new FirebaseAuth(() =>
+      extractRefreshTokenCandidates(
+        undefined,
+        browserSelection ? { selection: browserSelection } : {}
+      )
+    )
+  );
 }
 
 /** The real transport: stdio, which claims this process's stdin and stdout. */
@@ -435,10 +448,19 @@ function defaultConnect(server: CopilotMoneyServer): Promise<void> {
  * passes nothing and behaves exactly as before.
  */
 export interface RunServerDeps {
-  /** Builds the GraphQL client. Default: {@link defaultGraphQLClient}. */
-  createGraphQLClient?: () => GraphQLClient;
+  /**
+   * Builds the GraphQL client, given the browser selection from
+   * {@link RunServerOptions}. Default: {@link defaultGraphQLClient}.
+   */
+  createGraphQLClient?: (browserSelection?: BrowserSelection) => GraphQLClient;
   /** Connects the transport. Default: {@link defaultConnect}. */
   connect?: (server: CopilotMoneyServer) => Promise<void>;
+}
+
+/** Non-test options for {@link runServer}. */
+export interface RunServerOptions {
+  /** `--browser` / `--browser-profile`: which browser session auth reads. */
+  browserSelection?: BrowserSelection;
 }
 
 /**
@@ -449,17 +471,19 @@ export interface RunServerDeps {
  * @param decodeTimeoutMs - Optional timeout for decode operations in milliseconds.
  * @param writeEnabled - If true, register write tools and enable GraphQL writes.
  * @param deps - Test seam; see {@link RunServerDeps}. Production passes nothing.
+ * @param options - See {@link RunServerOptions}.
  */
 export async function runServer(
   dbPath?: string,
   decodeTimeoutMs?: number,
   writeEnabled = false,
   liveReadsEnabled = false,
-  deps: RunServerDeps = {}
+  deps: RunServerDeps = {},
+  options: RunServerOptions = {}
 ): Promise<void> {
   let graphqlClient: GraphQLClient | undefined;
   if (writeEnabled || liveReadsEnabled) {
-    graphqlClient = (deps.createGraphQLClient ?? defaultGraphQLClient)();
+    graphqlClient = (deps.createGraphQLClient ?? defaultGraphQLClient)(options.browserSelection);
   }
 
   const server = new CopilotMoneyServer(

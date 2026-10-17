@@ -4,6 +4,19 @@
  */
 
 import { runServer } from './server.js';
+import {
+  BrowserSelectionError,
+  describeBrowserSelection,
+  parseBrowserSelection,
+  validBrowserNames,
+  type BrowserSelection,
+} from './core/auth/browser-selection.js';
+
+/** Print a fatal argument error to stderr and exit 1. */
+function failArgs(message: string): never {
+  console.error(message);
+  process.exit(1);
+}
 
 /**
  * Parse command-line arguments.
@@ -14,6 +27,7 @@ function parseArgs(): {
   timeoutMs?: number;
   writeFlagSeen: boolean;
   liveReadsEnabled: boolean;
+  browserSelection?: BrowserSelection;
 } {
   const args = process.argv.slice(2);
   let dbPath: string | undefined;
@@ -21,6 +35,8 @@ function parseArgs(): {
   let timeoutMs: number | undefined;
   let writeFlagSeen = false;
   let liveReadsEnabled = false;
+  let browserFlag: string | undefined;
+  let profileFlag: string | undefined;
 
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
@@ -46,6 +62,14 @@ function parseArgs(): {
       writeFlagSeen = true;
     } else if (arg === '--live-reads') {
       liveReadsEnabled = true;
+    } else if (arg === '--browser' || arg === '--browser-profile') {
+      const value = args[i + 1];
+      if (value === undefined || value.startsWith('--') || !value.trim()) {
+        failArgs(`${arg} requires a value`);
+      }
+      if (arg === '--browser') browserFlag = value;
+      else profileFlag = value;
+      i++;
     } else if (arg === '--help' || arg === '-h') {
       console.error(`
 Copilot Money MCP Server - Expose financial data through MCP
@@ -58,11 +82,20 @@ Options:
   --timeout <ms>      Decode timeout in milliseconds (default: 90000 = 90 seconds)
   --write             Enable write tools (implies --live-reads)
   --live-reads        Enable GraphQL-backed get_transactions_live (replaces cache-backed get_transactions). Requires authenticated browser session at app.copilot.money.
+  --browser <name>    Read the Copilot session from this browser only (no fallback to others).
+                      One of: ${validBrowserNames().join(', ')}
+  --browser-profile <name>
+                      With --browser: read only this profile — a directory name
+                      ("Default", "Profile 2") or the profile's display name
+                      (Firefox: directory, its suffix like "default-release", or profiles.ini Name)
   --verbose, -v       Enable verbose logging
   --help, -h          Show this help message
 
 Environment:
   DECODE_TIMEOUT_MS   Override decode timeout (same as --timeout flag)
+  COPILOT_BROWSER     Same as --browser (the flag wins)
+  COPILOT_BROWSER_PROFILE
+                      Same as --browser-profile (the flag wins)
   The server uses stdio transport and logs to stderr.
   Claude Desktop will communicate with it via stdin/stdout.
 `);
@@ -74,7 +107,15 @@ Environment:
     liveReadsEnabled = true;
   }
 
-  return { dbPath, verbose, timeoutMs, writeFlagSeen, liveReadsEnabled };
+  let browserSelection: BrowserSelection | undefined;
+  try {
+    browserSelection = parseBrowserSelection({ browserFlag, profileFlag });
+  } catch (err) {
+    if (err instanceof BrowserSelectionError) failArgs(err.message);
+    throw err;
+  }
+
+  return { dbPath, verbose, timeoutMs, writeFlagSeen, liveReadsEnabled, browserSelection };
 }
 
 /**
@@ -103,7 +144,8 @@ function configureLogging(verbose: boolean): void {
  * Main entry point.
  */
 async function main(): Promise<void> {
-  const { dbPath, verbose, timeoutMs, writeFlagSeen, liveReadsEnabled } = parseArgs();
+  const { dbPath, verbose, timeoutMs, writeFlagSeen, liveReadsEnabled, browserSelection } =
+    parseArgs();
 
   configureLogging(verbose);
 
@@ -122,10 +164,18 @@ async function main(): Promise<void> {
       if (liveReadsEnabled) {
         console.log('Live reads enabled (--live-reads)');
       }
+      if (browserSelection) {
+        console.log(
+          liveReadsEnabled
+            ? `Browser session: ${describeBrowserSelection(browserSelection)} only`
+            : `Browser selection ${describeBrowserSelection(browserSelection)} ignored: ` +
+                'it only applies with --live-reads or --write'
+        );
+      }
       /* eslint-enable no-console */
     }
 
-    await runServer(dbPath, timeoutMs, writeFlagSeen, liveReadsEnabled);
+    await runServer(dbPath, timeoutMs, writeFlagSeen, liveReadsEnabled, {}, { browserSelection });
   } catch (error) {
     console.error('Server error:', error);
     process.exit(1);

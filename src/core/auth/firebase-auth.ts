@@ -261,7 +261,7 @@ export class FirebaseAuth {
 
     // Cold path: try each discovered candidate, discarding the ones the
     // endpoint rejects and keeping the first that exchanges cleanly.
-    const { candidates, checked } = await this.extractToken();
+    const { candidates, checked, selection } = await this.extractToken();
 
     // A rejection that was NOT "this token is foreign" — kept so it can be
     // surfaced if nothing else works, instead of being flattened into the
@@ -314,7 +314,7 @@ export class FirebaseAuth {
 
     // Every candidate was foreign-project (or none were found): the user is
     // logged out. Surface the actionable message, never a raw Firebase 400.
-    throw noCopilotSessionError(checked);
+    throw noCopilotSessionError(checked, selection);
   }
 
   getUserId(): string | null {

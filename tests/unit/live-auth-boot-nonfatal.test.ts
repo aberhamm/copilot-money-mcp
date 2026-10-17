@@ -445,6 +445,28 @@ describe('runServer connects the transport before probing, and never waits on it
     ).toEqual(['connect', 'probe']);
   });
 
+  test('threads the browser selection into the GraphQL client factory', async () => {
+    const seen: unknown[] = [];
+    await within(
+      runServer(
+        '/nonexistent/run-server-browser-selection',
+        undefined,
+        false,
+        true,
+        {
+          createGraphQLClient: (selection) => {
+            seen.push(selection);
+            return hangingClient(() => {});
+          },
+          connect: () => Promise.resolve(),
+        },
+        { browserSelection: { browser: 'brave', profile: 'Default' } }
+      ),
+      'runServer did not return with a browser selection'
+    );
+    expect(seen).toEqual([{ browser: 'brave', profile: 'Default' }]);
+  });
+
   test('guards the gate: without --live-reads there is no probe at all', async () => {
     // Pins that the assertion above is about ORDER, not about the probe being
     // unreachable. If `createGraphQLClient` were never called in live mode,
