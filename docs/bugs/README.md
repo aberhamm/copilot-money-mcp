@@ -274,12 +274,13 @@ record near-misses.
 
 ### Our own machinery
 
-**`path-divergence`** — 2
+**`path-divergence`** — 3
 
 | | Bug | Found by | Date |
 |---|---|---|---|
 | #530 | [The live conformance smoke crashed on startup for a month — scripts/ silently drifted from a src/ contract change](530-scripts-drift-smoke-gate-crash.md) | `live-probe` | 2026-07-11 |
 | #843 | [transaction_type refunds and credits selected different, even disjoint, rows in cache and live mode](843-transaction-type-mode-divergence.md) | `live-probe` | 2026-10-18 |
+| #848 | [get_recurring_live returned category_name null on every row until another tool had loaded categories](848-recurring-category-name-cold-cache.md) | `live-probe` | 2026-10-18 |
 
 **`vacuous-assertion`** — 1
 
