@@ -119,8 +119,8 @@ function findRealDatabase(): string | undefined {
 // Check if tests are enabled via environment variable
 const RUN_REAL_DB_TESTS = process.env.RUN_REAL_DB_TESTS === '1';
 
-// Find database once at module load time
-const REAL_DB_PATH = findRealDatabase();
+// Do not trigger macOS App Data consent for an opted-out test suite.
+const REAL_DB_PATH = RUN_REAL_DB_TESTS ? findRealDatabase() : undefined;
 const HAS_REAL_DB = REAL_DB_PATH !== undefined && RUN_REAL_DB_TESTS;
 
 interface DataStats {
