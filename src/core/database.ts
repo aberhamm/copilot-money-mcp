@@ -169,7 +169,8 @@ export interface DecodeHealth {
  * using `clearCache()`.
  */
 export class CopilotDatabase {
-  private dbPath: string | undefined;
+  // null means discovery is deferred; undefined means no database was found.
+  private dbPath: string | undefined | null;
   private _transactions: Transaction[] | null = null;
   private _accounts: Account[] | null = null;
   private _recurring: Recurring[] | null = null;
@@ -218,17 +219,14 @@ export class CopilotDatabase {
    * Initialize database connection.
    *
    * @param dbPath - Path to LevelDB database directory.
-   *                If undefined, auto-detects Copilot Money location.
+   *                If undefined, auto-detects on the first cache request.
    * @param decodeTimeoutMs - Optional timeout for decode operations in milliseconds.
    *                         If undefined, falls back to DECODE_TIMEOUT_MS env var or default.
    */
   constructor(dbPath?: string, decodeTimeoutMs?: number) {
-    if (dbPath) {
-      this.dbPath = dbPath;
-    } else {
-      // Auto-detect database location
-      this.dbPath = findCopilotDatabase();
-    }
+    // Directory enumeration can wait for macOS App Data consent. Live API
+    // tools and the MCP handshake must not wait for access to the local cache.
+    this.dbPath = dbPath || null;
     this.decodeTimeoutMs = decodeTimeoutMs;
   }
 
@@ -236,12 +234,13 @@ export class CopilotDatabase {
    * Get the database path, throwing if not available.
    */
   private requireDbPath(): string {
-    if (!this.dbPath) {
+    const dbPath = this.getDbPath();
+    if (!dbPath) {
       throw new Error(
         'Database not found. Please ensure Copilot Money is installed and has synced data.'
       );
     }
-    return this.dbPath;
+    return dbPath;
   }
 
   /**
@@ -249,12 +248,13 @@ export class CopilotDatabase {
    */
   isAvailable(): boolean {
     try {
-      if (!this.dbPath || !existsSync(this.dbPath)) {
+      const dbPath = this.getDbPath();
+      if (!dbPath || !existsSync(dbPath)) {
         return false;
       }
 
       // Check if directory contains .ldb files or LevelDB manifest
-      const files = readdirSync(this.dbPath);
+      const files = readdirSync(dbPath);
       return files.some((file) => file.endsWith('.ldb') || file.startsWith('MANIFEST-'));
     } catch {
       return false;
@@ -1428,6 +1428,9 @@ export class CopilotDatabase {
    * Get database path, or undefined if not found.
    */
   getDbPath(): string | undefined {
+    if (this.dbPath === null) {
+      this.dbPath = findCopilotDatabase();
+    }
     return this.dbPath;
   }
 

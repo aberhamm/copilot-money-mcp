@@ -206,8 +206,10 @@ export class CopilotMoneyServer {
       };
     }
 
-    // Check if database is available
-    if (!this.db.isAvailable()) {
+    // API tools do not depend on the desktop app's local cache. In live
+    // mode, writes resolve transaction metadata through the API as well.
+    const usesLiveApi = toolDef?.requiresLiveReads || (isWriteTool && this.live);
+    if (!usesLiveApi && !this.db.isAvailable()) {
       return {
         content: [
           {
