@@ -87,7 +87,7 @@
  *   - any other route to ambient machine state. This closes one resource, not
  *     the class. It is exact for that resource only because
  *     `findCopilotDatabase` has exactly one call site and is not exported,
- *     which `the constructor is still the only route` below re-checks rather
+ *     which the discovery call-site assertion below re-checks rather
  *     than assumes — an under-collecting scan reports clean, so the premise
  *     has to be asserted, not inherited from the day it was written. That
  *     re-check is itself a name match over one file: `export const findDb =
@@ -511,20 +511,20 @@ describe('no test discovers the real Copilot database', () => {
     ).toEqual([]);
   });
 
-  test('guards the gate: the constructor is still the only route to discovery', () => {
+  test('guards the gate: implicit-path cache access is still the only route to discovery', () => {
     // Parsed once and handed to both walks. `sweepSuite()` two functions up is
     // memoised for exactly this reason, and one file's AST built twice in one
     // test would read as an oversight rather than a choice.
     const databaseSource = parse(DATABASE_SOURCE);
-    // This gate is exact only while argument-less construction is the sole way
-    // a test can reach `findCopilotDatabase`. A second call site, or an
+    // Implicit-path construction permits discovery on a later cache access.
+    // Keep the conservative construction fence: a second call site, or an
     // `export`, would leave the sweep reporting clean over a route it cannot
     // see — the failure mode this project files under `silent-under-collecting-scan`.
     expect(
       discoveryCallSites(databaseSource),
-      `src/core/database.ts must call findCopilotDatabase() from the constructor and nowhere ` +
+      `src/core/database.ts must call findCopilotDatabase() from rediscoverIfTransient and nowhere ` +
         `else, or the sweep below stops being an exact statement about what tests can reach.`
-    ).toEqual(['CopilotDatabase constructor']);
+    ).toEqual(['method rediscoverIfTransient']);
     expect(
       discoveryExports(databaseSource),
       'findCopilotDatabase() must stay module-private. Exported under ANY spelling — a ' +

@@ -152,8 +152,8 @@ export function discoverCopilotDatabase(home: string): DatabaseDiscovery {
 
 /**
  * Find the Copilot Money database in the current user's home directory.
- * The constructor's no-path branch is the only caller. The home it searched is
- * returned too, so a retryable failure can be re-looked at in the same place.
+ * Only the first cache access without an explicit path calls this function.
+ * The home it searched is returned too, so a retryable failure can be re-looked at in the same place.
  */
 function findCopilotDatabase(): DatabaseDiscovery & { home: string } {
   const home = homedir();
@@ -291,6 +291,7 @@ export interface DecodeHealth {
  */
 export class CopilotDatabase {
   private dbPath: string | undefined;
+  private discoveryPending: boolean;
   private _transactions: Transaction[] | null = null;
   private _accounts: Account[] | null = null;
   private _recurring: Recurring[] | null = null;
@@ -358,20 +359,13 @@ export class CopilotDatabase {
    * Initialize database connection.
    *
    * @param dbPath - Path to LevelDB database directory.
-   *                If undefined, auto-detects Copilot Money location.
+   *                If undefined, auto-detects on the first cache access.
    * @param decodeTimeoutMs - Optional timeout for decode operations in milliseconds.
    *                         If undefined, falls back to DECODE_TIMEOUT_MS env var or default.
    */
   constructor(dbPath?: string, decodeTimeoutMs?: number) {
-    if (dbPath) {
-      this.dbPath = dbPath;
-    } else {
-      // Auto-detect database location
-      const discovery = findCopilotDatabase();
-      this.dbPath = discovery.path;
-      this.discoveryError = discovery.lookupError;
-      this.discoveryHome = discovery.home;
-    }
+    this.dbPath = dbPath || undefined;
+    this.discoveryPending = !dbPath;
     this.decodeTimeoutMs = decodeTimeoutMs;
   }
 
@@ -422,8 +416,8 @@ export class CopilotDatabase {
   /**
    * Look again when no-path discovery failed with a retryable errno.
    *
-   * Discovery runs once, in the constructor. Its error used to be stored and
-   * served on every later call without a syscall, so the message's own advice —
+   * Discovery first runs on cache access, never during startup. Previously its
+   * error was served on every later call without a syscall, so its own advice —
    * the read was interrupted, retry the request — could never change the
    * answer; only restarting the server could. A retryable failure is by
    * definition one a later look may settle, so it gets that look. A persistent
@@ -431,6 +425,15 @@ export class CopilotDatabase {
    * permissions, and re-walking the container on every call would not help.
    */
   private rediscoverIfTransient(): void {
+    if (this.discoveryPending) {
+      this.discoveryPending = false;
+      const discovery = findCopilotDatabase();
+      this.dbPath = discovery.path;
+      this.discoveryError = discovery.lookupError;
+      this.discoveryHome = discovery.home;
+      // Preserve this request's outcome; only a subsequent access may retry.
+      return;
+    }
     if (this.dbPath || !this.discoveryHome || !isRetryableErrno(this.discoveryError)) return;
     const again = discoverCopilotDatabase(this.discoveryHome);
     this.dbPath = again.path;
