@@ -118,8 +118,8 @@ function findRealDatabase(): string | undefined {
 // Check if tests are enabled via environment variable
 const RUN_REAL_DB_TESTS = process.env.RUN_REAL_DB_TESTS === '1';
 
-// Find database once at module load time
-const REAL_DB_PATH = findRealDatabase();
+// Discover only after explicit opt-in, never during ordinary test collection
+const REAL_DB_PATH = RUN_REAL_DB_TESTS ? findRealDatabase() : undefined;
 const HAS_REAL_DB = REAL_DB_PATH !== undefined && RUN_REAL_DB_TESTS;
 
 interface DataStats {
